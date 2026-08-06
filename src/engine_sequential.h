@@ -121,8 +121,8 @@ public:
         writer.close();
 
         m.total_time_us  = us(Clock::now(), t_total);
-        m.avg_per_row_us = m.total_rows_out > 0
-            ? m.total_time_us / static_cast<double>(m.total_rows_out)
+        m.avg_per_row_us = m.total_rows_in > 0
+            ? m.total_time_us / static_cast<double>(m.total_rows_in)
             : 0;
         m.peak_memory_kb = get_peak_rss_kb();
         return m;

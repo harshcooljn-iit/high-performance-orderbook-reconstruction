@@ -170,7 +170,7 @@ public:
         m.write_time_us   = wr_us;
         m.total_rows_in   = rows_read.load();
         m.total_rows_out  = rows_written.load();
-        m.avg_per_row_us  = m.total_time_us / std::max(m.total_rows_out, size_t(1));
+        m.avg_per_row_us  = m.total_time_us / std::max(m.total_rows_in, size_t(1));
         m.peak_memory_kb  = get_peak_rss_kb();
         return m;
     }
