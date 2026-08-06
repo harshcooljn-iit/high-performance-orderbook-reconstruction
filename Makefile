@@ -30,5 +30,13 @@ run: $(TARGET)
 	@echo ""
 	./$(TARGET) data/mbo.csv --reference data/mbp.csv
 
+stress: $(TARGET)
+	@echo ""
+	@echo "═══════════════════════════════════════════════════════════"
+	@echo "  Running Stress Test on 2M rows..."
+	@echo "═══════════════════════════════════════════════════════════"
+	@echo ""
+	./$(TARGET) data/mbo_2M.csv
+
 clean:
 	rm -rf $(BUILD_DIR)
