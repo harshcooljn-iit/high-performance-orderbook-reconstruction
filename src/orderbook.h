@@ -1,12 +1,66 @@
 #pragma once
 #include "types.h"
-#include <map>
-#include <unordered_map>
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
 
 namespace obr {
 
+// ─── L2-fitting open-addressing hash map ──────────────────────────
+// 16K entries × 12 bytes = 192KB — fits in L2 cache.
+// Uses Fibonacci hashing for excellent distribution.
+class FastOrderMap {
+    static constexpr size_t CAP = 1 << 14; // 16384
+    static constexpr size_t MASK = CAP - 1;
+    struct alignas(16) Slot { uint64_t key; uint32_t size; uint32_t _pad; };
+    Slot* slots;
+
+public:
+    FastOrderMap() {
+        slots = static_cast<Slot*>(std::aligned_alloc(64, CAP * sizeof(Slot)));
+        std::memset(slots, 0, CAP * sizeof(Slot));
+    }
+    ~FastOrderMap() { std::free(slots); }
+
+    void clear() {
+        std::memset(slots, 0, CAP * sizeof(Slot));
+    }
+
+    __attribute__((always_inline))
+    uint32_t& operator[](uint64_t key) {
+        size_t idx = (key * 11400714819323198485ull) >> (64 - 14); // top bits
+        while (slots[idx].key != 0 && slots[idx].key != key) {
+            idx = (idx + 1) & MASK;
+        }
+        if (slots[idx].key == 0) {
+            slots[idx].key = key;
+            slots[idx].size = 0;
+        }
+        return slots[idx].size;
+    }
+
+    __attribute__((always_inline))
+    uint32_t* find(uint64_t key) {
+        size_t idx = (key * 11400714819323198485ull) >> (64 - 14);
+        while (slots[idx].key != 0) {
+            if (slots[idx].key == key) return &slots[idx].size;
+            idx = (idx + 1) & MASK;
+        }
+        return nullptr;
+    }
+
+    // Prefetch the likely slot for a future lookup
+    __attribute__((always_inline))
+    void prefetch(uint64_t key) const {
+        size_t idx = (key * 11400714819323198485ull) >> (64 - 14);
+        __builtin_prefetch(&slots[idx], 0, 1); // read, low temporal locality
+    }
+};
+
+// ─── Orderbook: maintains sorted bid/ask levels ───────────────────
+// Uses static arrays of 12 levels + overflow arrays of 256.
+// Key change: PriceLevel no longer maintains pre-formatted strings.
+// Formatting happens LAZILY only when output is produced.
 class Orderbook {
 public:
     Orderbook() { reset(); }
@@ -16,39 +70,39 @@ public:
         n_bid_ = 0;
         n_ask_ = 0;
         orders_.clear();
-        orders_.reserve(4096);
-        asks_map_.clear();
-        bids_map_.clear();
+        n_asks_map_ = 0;
+        n_bids_map_ = 0;
         depth_ = 0;
         trade_pending_ = false;
         is_bid_level_changed_ = false;
     }
 
-    // ── Apply an MBO event to the book ────────────────────────────
-    // Returns true if this event should produce an MBP output row
-    bool apply(MboRecord& mbo) {
+    __attribute__((hot))
+    bool apply(const MboRecord& mbo) {
         depth_ = 0;
 
-        if (mbo.action == Action::Add) {
+        switch (static_cast<char>(mbo.action)) {
+        case 'A':
             if (mbo.side == Side::Bid)      add_bid(mbo);
             else if (mbo.side == Side::Ask) add_ask(mbo);
-        }
-        else if (mbo.action == Action::Cancel) {
+            break;
+        case 'C':
             if (mbo.side == Side::Bid)      cancel_bid(mbo);
             else if (mbo.side == Side::Ask) cancel_ask(mbo);
-        }
-        else if (mbo.action == Action::Trade) {
-            if (mbo.side != Side::None) {
-                trade_pending_ = true;
-            }
+            break;
+        case 'T':
+            if (mbo.side != Side::None) trade_pending_ = true;
+            break;
+        default:
+            break;
         }
 
-        // Filtering rules (from reference):
-        if (depth_ >= 12)                                  return false;
-        if (trade_pending_ && mbo.action != Action::Cancel) return false;
-        if (depth_ == 11 && !(mbo.action == Action::Cancel &&
-                              mbo.side == Side::Bid &&
-                              is_bid_level_changed_))       return false;
+        if (__builtin_expect(depth_ >= 12, 0))                return false;
+        if (trade_pending_ && mbo.action != Action::Cancel)    return false;
+        if (__builtin_expect(depth_ == 11, 0) &&
+            !(mbo.action == Action::Cancel &&
+              mbo.side == Side::Bid &&
+              is_bid_level_changed_))                          return false;
 
         return true;
     }
@@ -57,104 +111,82 @@ public:
     bool trade_pending() const { return trade_pending_; }
     int  depth() const { return depth_; }
 
-    // ── Snapshot top-10 ────────────────────────────────────────────
-    void snapshot(PriceLevel* out_bids, PriceLevel* out_asks) const {
-        int bd = std::min(n_bid_, MAX_DEPTH);
-        int ad = std::min(n_ask_, MAX_DEPTH);
-        for (int i = 0; i < bd; i++) out_bids[i] = bids_[i];
-        for (int i = bd; i < MAX_DEPTH; i++) out_bids[i].clear();
-        for (int i = 0; i < ad; i++) out_asks[i] = asks_[i];
-        for (int i = ad; i < MAX_DEPTH; i++) out_asks[i].clear();
+    // ── Direct-to-buffer formatting ───────────────────────────────
+    // Writes bid/ask levels directly into the output buffer.
+    // Returns pointer past end of written data.
+    __attribute__((hot))
+    char* write_levels(char* __restrict__ p) const {
+        int bd = std::min(n_bid_, 10);
+        int ad = std::min(n_ask_, 10);
+
+        for (int i = 0; i < 10; i++) {
+            if (i < bd) p = write_level_ptr(p, bids_[i]);
+            else        p = write_empty_level(p);
+            if (i < ad) p = write_level_ptr(p, asks_[i]);
+            else        p = write_empty_level(p);
+        }
+        return p;
     }
 
-    int n_bid() const { return n_bid_; }
-    int n_ask() const { return n_ask_; }
-
 private:
-    PriceLevel bids_[MAX_LEVELS];       // descending by price
-    PriceLevel asks_[MAX_LEVELS];       // ascending  by price
+    PriceLevel bids_[MAX_LEVELS];
+    PriceLevel asks_[MAX_LEVELS];
     int n_bid_ = 0;
     int n_ask_ = 0;
     int depth_ = 0;
     bool trade_pending_ = false;
     bool is_bid_level_changed_ = false;
 
-    // order_id → remaining size (for count tracking)
-    std::unordered_map<uint64_t, uint32_t> orders_;
+    FastOrderMap orders_;
 
-    // Overflow maps: sorted by price (asks ascending, bids descending)
-    std::map<int64_t, PriceLevel> asks_map_;
-    std::map<int64_t, PriceLevel, std::greater<int64_t>> bids_map_;
+    PriceLevel asks_map_[256];
+    int n_asks_map_ = 0;
+    PriceLevel bids_map_[256];
+    int n_bids_map_ = 0;
 
-    // ── Add Ask ───────────────────────────────────────────────────
-    void add_ask(MboRecord& mbo) {
-        bool inc_count = false;
-        auto it = orders_.find(mbo.order_id);
-        if (it != orders_.end()) {
-            it->second += static_cast<uint32_t>(mbo.size);
-        } else {
-            orders_[mbo.order_id] = static_cast<uint32_t>(mbo.size);
-            inc_count = true;
-        }
+    __attribute__((always_inline))
+    void add_ask(const MboRecord& mbo) {
+        uint32_t& sz = orders_[mbo.order_id];
+        bool inc_count = (sz == 0);
+        sz += mbo.size;
 
-        // Check if price fits in top 12
+        int limit = std::min(n_ask_, 12);
         if (n_ask_ < 12 || mbo.price <= asks_[11].price) {
             int i = 0;
-            for (; i < std::min(n_ask_, 12); i++) {
+            for (; i < limit; i++) {
                 if (mbo.price <= asks_[i].price) break;
             }
             depth_ = i;
 
             if (i < n_ask_ && mbo.price == asks_[i].price) {
-                // Existing level
                 asks_[i].size += mbo.size;
                 if (inc_count) asks_[i].count++;
+                asks_[i].reformat();
             } else {
-                // New level - push overflow to map
                 if (n_ask_ == 12) {
-                    asks_map_[asks_[11].price] = asks_[11];
+                    insert_ask_map(asks_[11]);
                 } else {
                     n_ask_++;
                 }
-                // Shift down
                 for (int j = 10; j >= i; j--) asks_[j + 1] = asks_[j];
-                // Insert
-                asks_[i].price = mbo.price;
-                std::memcpy(asks_[i].price_str, mbo.price_str, sizeof(asks_[i].price_str));
-                asks_[i].size = mbo.size;
-                asks_[i].count = 1;
+                asks_[i].init(mbo.price, mbo.size, mbo.price_str, mbo.price_len);
             }
         } else {
-            // Goes into overflow map
-            if (asks_map_.count(mbo.price)) {
-                asks_map_[mbo.price].size += mbo.size;
-                if (inc_count) asks_map_[mbo.price].count++;
-            } else {
-                PriceLevel lv;
-                lv.price = mbo.price;
-                std::memcpy(lv.price_str, mbo.price_str, sizeof(lv.price_str));
-                lv.size = mbo.size;
-                lv.count = 1;
-                asks_map_[mbo.price] = lv;
-            }
+            add_ask_map(mbo, inc_count);
             depth_ = 12;
         }
     }
 
-    // ── Add Bid ───────────────────────────────────────────────────
-    void add_bid(MboRecord& mbo) {
-        bool inc_count = false;
-        auto it = orders_.find(mbo.order_id);
-        if (it != orders_.end()) {
-            it->second += static_cast<uint32_t>(mbo.size);
-        } else {
-            orders_[mbo.order_id] = static_cast<uint32_t>(mbo.size);
-            inc_count = true;
-        }
+    __attribute__((always_inline))
+    void add_bid(const MboRecord& mbo) {
+        uint32_t& sz = orders_[mbo.order_id];
+        bool inc_count = (sz == 0);
+        sz += mbo.size;
 
+        int limit = std::min(n_bid_, 12);
         if (n_bid_ < 12 || mbo.price >= bids_[11].price) {
             int i = 0;
-            for (; i < std::min(n_bid_, 12); i++) {
+            for (; i < limit; i++) {
                 if (mbo.price >= bids_[i].price) break;
             }
             depth_ = i;
@@ -163,136 +195,183 @@ private:
                 is_bid_level_changed_ = false;
                 bids_[i].size += mbo.size;
                 if (inc_count) bids_[i].count++;
+                bids_[i].reformat();
             } else {
                 is_bid_level_changed_ = true;
                 if (n_bid_ == 12) {
-                    bids_map_[bids_[11].price] = bids_[11];
+                    insert_bid_map(bids_[11]);
                 } else {
                     n_bid_++;
                 }
                 for (int j = 10; j >= i; j--) bids_[j + 1] = bids_[j];
-                bids_[i].price = mbo.price;
-                std::memcpy(bids_[i].price_str, mbo.price_str, sizeof(bids_[i].price_str));
-                bids_[i].size = mbo.size;
-                bids_[i].count = 1;
+                bids_[i].init(mbo.price, mbo.size, mbo.price_str, mbo.price_len);
             }
         } else {
-            if (bids_map_.count(mbo.price)) {
-                is_bid_level_changed_ = false;
-                bids_map_[mbo.price].size += mbo.size;
-                if (inc_count) bids_map_[mbo.price].count++;
-            } else {
-                is_bid_level_changed_ = true;
-                PriceLevel lv;
-                lv.price = mbo.price;
-                std::memcpy(lv.price_str, mbo.price_str, sizeof(lv.price_str));
-                lv.size = mbo.size;
-                lv.count = 1;
-                bids_map_[mbo.price] = lv;
-            }
+            add_bid_map(mbo, inc_count);
             depth_ = 12;
         }
     }
 
-    // ── Cancel Ask ────────────────────────────────────────────────
-    void cancel_ask(MboRecord& mbo) {
+    __attribute__((always_inline))
+    void cancel_ask(const MboRecord& mbo) {
         bool dec_count = false;
-        auto it = orders_.find(mbo.order_id);
-        if (it != orders_.end()) {
-            it->second -= static_cast<uint32_t>(mbo.size);
-            if (static_cast<int32_t>(it->second) <= 0) {
-                orders_.erase(it);
-                dec_count = true;
-            }
+        uint32_t* sz = orders_.find(mbo.order_id);
+        if (sz) {
+            *sz -= mbo.size;
+            if (*sz == 0) dec_count = true;
         } else {
             orders_[mbo.order_id] = 0;
         }
 
-        if (asks_map_.empty() || mbo.price <= asks_[11].price) {
+        if (n_asks_map_ == 0 || mbo.price <= asks_[11].price) {
             int i = 0;
-            for (; i < std::min(n_ask_, 12); i++) {
+            int limit = std::min(n_ask_, 12);
+            for (; i < limit; i++) {
                 if (mbo.price <= asks_[i].price) break;
             }
             depth_ = i;
 
-            if (mbo.price == asks_[i].price) {
+            if (i < n_ask_ && mbo.price == asks_[i].price) {
                 asks_[i].size -= mbo.size;
                 if (dec_count) asks_[i].count--;
-
                 if (asks_[i].size <= 0) {
-                    // Remove level, shift up
-                    for (; i < std::min(n_ask_, 12) - 1; i++) {
-                        asks_[i] = asks_[i + 1];
-                    }
-                    if (n_ask_ == 12 && !asks_map_.empty()) {
-                        asks_[11] = asks_map_.begin()->second;
-                        asks_map_.erase(asks_map_.begin());
+                    for (; i < std::min(n_ask_, 12) - 1; i++) asks_[i] = asks_[i + 1];
+                    if (n_ask_ == 12 && n_asks_map_ > 0) {
+                        asks_[11] = asks_map_[0];
+                        for (int j = 0; j < n_asks_map_ - 1; j++) asks_map_[j] = asks_map_[j+1];
+                        n_asks_map_--;
                     } else {
                         n_ask_--;
                     }
+                } else {
+                    asks_[i].reformat();
                 }
             }
-            // else: level not found (shouldn't happen with valid data)
         } else {
-            asks_map_[mbo.price].size -= mbo.size;
-            if (dec_count) asks_map_[mbo.price].count--;
-            if (asks_map_[mbo.price].size <= 0) {
-                asks_map_.erase(mbo.price);
-            }
+            cancel_ask_map(mbo, dec_count);
             depth_ = 12;
         }
     }
 
-    // ── Cancel Bid ────────────────────────────────────────────────
-    void cancel_bid(MboRecord& mbo) {
+    __attribute__((always_inline))
+    void cancel_bid(const MboRecord& mbo) {
         bool dec_count = false;
-        auto it = orders_.find(mbo.order_id);
-        if (it != orders_.end()) {
-            it->second -= static_cast<uint32_t>(mbo.size);
-            if (static_cast<int32_t>(it->second) <= 0) {
-                orders_.erase(it);
-                dec_count = true;
-            }
+        uint32_t* sz = orders_.find(mbo.order_id);
+        if (sz) {
+            *sz -= mbo.size;
+            if (*sz == 0) dec_count = true;
         } else {
             orders_[mbo.order_id] = 0;
         }
 
         if (n_bid_ < 12 || mbo.price >= bids_[11].price) {
             int i = 0;
-            for (; i < std::min(n_bid_, 12); i++) {
+            int limit = std::min(n_bid_, 12);
+            for (; i < limit; i++) {
                 if (mbo.price >= bids_[i].price) break;
             }
             depth_ = i;
 
-            if (mbo.price == bids_[i].price) {
+            if (i < n_bid_ && mbo.price == bids_[i].price) {
                 bids_[i].size -= mbo.size;
                 if (dec_count) bids_[i].count--;
-
                 if (bids_[i].size <= 0) {
                     is_bid_level_changed_ = true;
-                    for (; i < std::min(n_bid_, 12) - 1; i++) {
-                        bids_[i] = bids_[i + 1];
-                    }
-                    if (n_bid_ == 12 && !bids_map_.empty()) {
-                        bids_[11] = bids_map_.begin()->second;
-                        bids_map_.erase(bids_map_.begin());
+                    for (; i < std::min(n_bid_, 12) - 1; i++) bids_[i] = bids_[i + 1];
+                    if (n_bid_ == 12 && n_bids_map_ > 0) {
+                        bids_[11] = bids_map_[0];
+                        for (int j = 0; j < n_bids_map_ - 1; j++) bids_map_[j] = bids_map_[j+1];
+                        n_bids_map_--;
                     } else {
                         n_bid_--;
                     }
                 } else {
                     is_bid_level_changed_ = false;
+                    bids_[i].reformat();
                 }
             }
         } else {
-            bids_map_[mbo.price].size -= mbo.size;
-            if (dec_count) bids_map_[mbo.price].count--;
-            if (bids_map_[mbo.price].size <= 0) {
-                bids_map_.erase(mbo.price);
+            cancel_bid_map(mbo, dec_count);
+            depth_ = 12;
+        }
+    }
+
+    // ── Overflow map operations (cold path) ───────────────────────
+    void insert_ask_map(const PriceLevel& lv) {
+        int i = 0;
+        while (i < n_asks_map_ && asks_map_[i].price < lv.price) i++;
+        for (int j = n_asks_map_; j > i; j--) asks_map_[j] = asks_map_[j - 1];
+        asks_map_[i] = lv;
+        n_asks_map_++;
+    }
+
+    void insert_bid_map(const PriceLevel& lv) {
+        int i = 0;
+        while (i < n_bids_map_ && bids_map_[i].price > lv.price) i++;
+        for (int j = n_bids_map_; j > i; j--) bids_map_[j] = bids_map_[j - 1];
+        bids_map_[i] = lv;
+        n_bids_map_++;
+    }
+
+    void add_ask_map(const MboRecord& mbo, bool inc_count) {
+        int i = 0;
+        while (i < n_asks_map_ && asks_map_[i].price < mbo.price) i++;
+        if (i < n_asks_map_ && asks_map_[i].price == mbo.price) {
+            asks_map_[i].size += mbo.size;
+            if (inc_count) asks_map_[i].count++;
+            asks_map_[i].reformat();
+        } else {
+            for (int j = n_asks_map_; j > i; j--) asks_map_[j] = asks_map_[j - 1];
+            asks_map_[i].init(mbo.price, mbo.size, mbo.price_str, mbo.price_len);
+            n_asks_map_++;
+        }
+    }
+
+    void add_bid_map(const MboRecord& mbo, bool inc_count) {
+        int i = 0;
+        while (i < n_bids_map_ && bids_map_[i].price > mbo.price) i++;
+        if (i < n_bids_map_ && bids_map_[i].price == mbo.price) {
+            bids_map_[i].size += mbo.size;
+            if (inc_count) bids_map_[i].count++;
+            bids_map_[i].reformat();
+            is_bid_level_changed_ = false;
+        } else {
+            for (int j = n_bids_map_; j > i; j--) bids_map_[j] = bids_map_[j - 1];
+            bids_map_[i].init(mbo.price, mbo.size, mbo.price_str, mbo.price_len);
+            n_bids_map_++;
+            is_bid_level_changed_ = true;
+        }
+    }
+
+    void cancel_ask_map(const MboRecord& mbo, bool dec_count) {
+        int i = 0;
+        while (i < n_asks_map_ && asks_map_[i].price < mbo.price) i++;
+        if (i < n_asks_map_ && asks_map_[i].price == mbo.price) {
+            asks_map_[i].size -= mbo.size;
+            if (dec_count) asks_map_[i].count--;
+            if (asks_map_[i].size <= 0) {
+                for (int j = i; j < n_asks_map_ - 1; j++) asks_map_[j] = asks_map_[j+1];
+                n_asks_map_--;
+            } else {
+                asks_map_[i].reformat();
+            }
+        }
+    }
+
+    void cancel_bid_map(const MboRecord& mbo, bool dec_count) {
+        int i = 0;
+        while (i < n_bids_map_ && bids_map_[i].price > mbo.price) i++;
+        if (i < n_bids_map_ && bids_map_[i].price == mbo.price) {
+            bids_map_[i].size -= mbo.size;
+            if (dec_count) bids_map_[i].count--;
+            if (bids_map_[i].size <= 0) {
+                for (int j = i; j < n_bids_map_ - 1; j++) bids_map_[j] = bids_map_[j+1];
+                n_bids_map_--;
                 is_bid_level_changed_ = true;
             } else {
+                bids_map_[i].reformat();
                 is_bid_level_changed_ = false;
             }
-            depth_ = 12;
         }
     }
 };
